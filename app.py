@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 """
-A minimal chatbot client that talks to the Cerebras chat completion API.
+A minimal standalone chatbot that talks to the Cerebras API.
 
-The script expects a prompt either:
-- as the first command‑line argument, e.g. `python chatbot.py "Hello!"`
-- or via the environment variable `CHATBOT_PROMPT`
-- if neither is provided, a default prompt is used so the script can run
-  non‑interactively (e.g. in CI).
+The script reads a user prompt from the command line arguments or stdin,
+sends it to the Cerebras chat completion endpoint, and prints the assistant
+reply.
 
-The Cerebras API key must be supplied via the environment variable
-`CEREBRAS_API_KEY`. If the key is missing the script aborts with a clear
-error message.
-
-Typical usage (locally):
-    export CEREBRAS_API_KEY=your_key_here
-    python chatbot.py "What is the capital of France?"
-
-Typical usage (GitHub Actions):
-    - set `CEREBRAS_API_KEY` as a secret
-    - optionally set `CHATBOT_PROMPT` or pass an argument to the step
+It exits with a non‑zero status and a clear error message if:
+* The CEREBRAS_API_KEY environment variable is missing.
+* The HTTP request fails or returns a non‑200 status.
+* The response payload is malformed.
 """
 
 import os
@@ -26,98 +17,107 @@ import sys
 import json
 import textwrap
 
-import requests  # external dependency
+import requests
 
+# ----------------------------------------------------------------------
+# Configuration
+# ----------------------------------------------------------------------
 API_ENDPOINT = "https://api.cerebras.ai/v1/chat/completions"
 MODEL_NAME = "gpt-oss-120b"
+TIMEOUT = 30  # seconds for the HTTP request
 
 
-def get_prompt() -> str:
-    """Return the prompt to send to the model.
-
-    Priority:
-    1. First CLI argument (everything after the script name)
-    2. Environment variable CHATBOT_PROMPT
-    3. Hard‑coded default (ensures the script runs without manual input)
-    """
-    if len(sys.argv) > 1:
-        # Join all args so users can pass a multi‑word prompt without quoting
-        return " ".join(sys.argv[1:])
-    env_prompt = os.getenv("CHATBOT_PROMPT")
-    if env_prompt:
-        return env_prompt
-    # Default prompt – a real request, not a fake placeholder
-    return "Tell me a short joke about computers."
+def fatal(msg: str) -> None:
+    """Print an error message to stderr and exit with status 1."""
+    print(f"ERROR: {msg}", file=sys.stderr)
+    sys.exit(1)
 
 
 def get_api_key() -> str:
     """Retrieve the Cerebras API key from the environment."""
     key = os.getenv("CEREBRAS_API_KEY")
     if not key:
-        sys.stderr.write(
-            "ERROR: CEREBRAS_API_KEY environment variable is not set.\n"
-        )
-        sys.exit(1)
-    return key.strip()
+        fatal("CEREBRAS_API_KEY environment variable is not set.")
+    return key
 
 
-def call_cerebras_api(prompt: str, api_key: str) -> str:
-    """Send the prompt to Cerebras and return the assistant's reply."""
+def get_user_prompt() -> str:
+    """
+    Determine the user prompt.
+
+    Preference order:
+    1. Command‑line arguments (joined with spaces)
+    2. Entire stdin (useful in CI pipelines)
+    3. A default placeholder prompt (ensures the script can run without input)
+    """
+    if len(sys.argv) > 1:
+        return " ".join(sys.argv[1:]).strip()
+
+    # Read everything from stdin (non‑blocking if the stream is empty)
+    if not sys.stdin.isatty():
+        data = sys.stdin.read()
+        if data.strip():
+            return data.strip()
+
+    # Fallback default – the script still produces a valid request.
+    return "Hello, how are you?"
+
+
+def call_cerebras_chat(api_key: str, prompt: str) -> str:
+    """Send a chat request to the Cerebras API and return the assistant's reply."""
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
+
     payload = {
         "model": MODEL_NAME,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": [
+            {"role": "user", "content": prompt}
+        ]
     }
 
     try:
-        response = requests.post(API_ENDPOINT, headers=headers, json=payload, timeout=30)
+        response = requests.post(
+            API_ENDPOINT,
+            headers=headers,
+            json=payload,
+            timeout=TIMEOUT,
+        )
     except requests.RequestException as exc:
-        sys.stderr.write(f"ERROR: Network request failed: {exc}\n")
-        sys.exit(1)
+        fatal(f"Network error while contacting Cerebras API: {exc}")
 
     if response.status_code != 200:
-        sys.stderr.write(
-            f"ERROR: API returned unexpected status {response.status_code}\n"
-            f"Response body: {response.text}\n"
+        # Attempt to surface the API's error message for debugging.
+        try:
+            err_detail = response.json()
+            err_msg = json.dumps(err_detail, indent=2)
+        except Exception:
+            err_msg = response.text
+        fatal(
+            f"Cerebras API returned HTTP {response.status_code}.\n"
+            f"Response body:\n{err_msg}"
         )
-        sys.exit(1)
 
     try:
         data = response.json()
-    except json.JSONDecodeError as exc:
-        sys.stderr.write(f"ERROR: Failed to parse JSON response: {exc}\n")
-        sys.exit(1)
+        # Expected format: {"choices": [{"message": {"content": "..."}}, ...], ...}
+        choice = data["choices"][0]
+        message = choice["message"]
+        content = message["content"]
+    except (KeyError, IndexError, TypeError) as exc:
+        fatal(f"Malformed response from Cerebras API: {exc}\nFull payload: {data}")
 
-    # The expected format follows OpenAI's chat completion schema:
-    # {
-    #   "choices": [{"message": {"role": "assistant", "content": "..."}}, ...],
-    #   ...
-    # }
-    try:
-        reply = data["choices"][0]["message"]["content"]
-    except (KeyError, IndexError) as exc:
-        sys.stderr.write(f"ERROR: Unexpected API response structure: {exc}\n")
-        sys.stderr.write(f"Full response: {json.dumps(data, indent=2)}\n")
-        sys.exit(1)
-
-    return reply.strip()
+    return content
 
 
 def main() -> None:
-    prompt = get_prompt()
     api_key = get_api_key()
+    prompt = get_user_prompt()
+    reply = call_cerebras_chat(api_key, prompt)
 
-    # Echo the prompt for visibility (useful in CI logs)
-    print(f"Prompt: {prompt}\n", file=sys.stderr)
-
-    reply = call_cerebras_api(prompt, api_key)
-
-    # Pretty‑print the assistant's reply
-    print("=== Assistant Reply ===")
-    print(reply)
+    # Print the reply; using textwrap to keep CI logs tidy.
+    print(textwrap.dedent(reply).strip())
 
 
 if __name__ == "__main__":
